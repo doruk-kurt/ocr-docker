@@ -14,7 +14,7 @@ import subprocess
 import threading
 import logging
 from io import BytesIO
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote_to_bytes
 import requests
 import runpod
 from PIL import Image
@@ -283,8 +283,20 @@ def _extract_job_image_and_prompt(job_input):
 
 
 def _read_image_bytes(url):
-    """Read image bytes from http(s), file://, or absolute local path."""
+    """Read image bytes from data URLs, http(s), file://, or absolute local path."""
     parsed = urlparse(url)
+    if parsed.scheme == "data":
+        header, sep, payload = url.partition(",")
+        if not sep:
+            raise ValueError("Malformed data URL: missing comma separator")
+
+        if ";base64" in header:
+            try:
+                return base64.b64decode(payload, validate=True)
+            except Exception as exc:
+                raise ValueError(f"Malformed base64 data URL: {exc}") from exc
+        return unquote_to_bytes(payload)
+
     if parsed.scheme in {"http", "https"}:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
