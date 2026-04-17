@@ -4,11 +4,12 @@ FROM vllm/vllm-openai:nightly
 RUN apt-get update && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 
-# Install newer Transformers so GLM-OCR is recognized, plus RunPod SDK
+# Install newer Transformers so GLM-OCR is recognized, plus worker/runtime deps.
+# vLLM nightly currently imports pandas during CLI startup.
 RUN pip uninstall -y transformers || true \
  && pip install -U git+https://github.com/huggingface/transformers.git \
  && pip install -U git+https://github.com/zai-org/glm-ocr.git \
- && pip install runpod requests pillow
+ && pip install runpod requests pillow pandas
 
 # Pre-download model weights into the image so cold starts don't hit HuggingFace
 ENV HF_HOME=/root/.cache/huggingface
