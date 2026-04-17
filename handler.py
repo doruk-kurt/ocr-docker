@@ -6,6 +6,7 @@ then forwards incoming RunPod jobs to the local OpenAI-compatible API.
 """
 
 import os
+import sys
 import time
 import base64
 import tempfile
@@ -35,6 +36,74 @@ MAX_IMAGE_SIDE = int(os.getenv("MAX_IMAGE_SIDE", "2000"))
 USE_GLMOCR_SDK = os.getenv("USE_GLMOCR_SDK", "1").lower() in {"1", "true", "yes"}
 
 OCR_PARSER = None
+VLLM_PROCESS = None
+VLLM_STARTUP_ERROR = None
+VLLM_READY = False
+
+
+def _truncate_text(value, limit=1000):
+    """Return a compact single-line string for logs and error payloads."""
+    if value is None:
+        return ""
+    text = str(value).strip().replace("\n", " ").replace("\r", " ")
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3]}..."
+
+
+def _collect_gpu_diagnostics():
+    """Collect lightweight GPU visibility diagnostics for startup failures."""
+    diagnostics = {
+        "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES", "<unset>"),
+        "NVIDIA_VISIBLE_DEVICES": os.getenv("NVIDIA_VISIBLE_DEVICES", "<unset>"),
+    }
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        diagnostics["nvidia_smi_exit_code"] = result.returncode
+        if result.stdout.strip():
+            diagnostics["nvidia_smi_stdout"] = _truncate_text(result.stdout, 500)
+        if result.stderr.strip():
+            diagnostics["nvidia_smi_stderr"] = _truncate_text(result.stderr, 500)
+    except Exception as exc:
+        diagnostics["nvidia_smi_error"] = str(exc)
+
+    return diagnostics
+
+
+def _format_gpu_diagnostics():
+    diagnostics = _collect_gpu_diagnostics()
+    return ", ".join(f"{key}={value}" for key, value in diagnostics.items())
+
+
+def _set_vllm_startup_error(message):
+    """Record a persistent startup error for later diagnostics."""
+    global VLLM_STARTUP_ERROR, VLLM_READY
+    VLLM_STARTUP_ERROR = message
+    VLLM_READY = False
+
+
+def _vllm_error_payload(job_id, message, **extra):
+    """Return a structured RunPod response instead of surfacing a generic 500."""
+    payload = {
+        "error": message,
+        "job_id": job_id,
+        "vllm_url": f"{VLLM_URL}/v1/chat/completions",
+    }
+
+    if VLLM_STARTUP_ERROR:
+        payload["startup_error"] = VLLM_STARTUP_ERROR
+    if VLLM_PROCESS is not None and VLLM_PROCESS.poll() is not None:
+        payload["vllm_exit_code"] = VLLM_PROCESS.returncode
+
+    payload.update({k: v for k, v in extra.items() if v not in {None, ""}})
+    return payload
 
 
 def stream_output(pipe):
@@ -52,6 +121,7 @@ def stream_output(pipe):
 
 def start_vllm():
     """Start vLLM as a background process with log forwarding."""
+    log.info("GPU diagnostics before vLLM start: %s", _format_gpu_diagnostics())
     cmd = [
         "vllm", "serve", MODEL_NAME,
         "--allowed-local-media-path", "/",
@@ -84,19 +154,45 @@ def start_vllm():
     return process
 
 
-def wait_for_vllm(timeout=600):
-    """Wait for vLLM to be ready."""
+def wait_for_vllm(process, timeout=600):
+    """Wait for vLLM HTTP server and engine core to be ready."""
+    global VLLM_READY
     start = time.time()
+    last_error = ""
     while time.time() - start < timeout:
+        if process.poll() is not None:
+            message = (
+                f"vLLM exited during startup with code {process.returncode}. "
+                f"GPU diagnostics: {_format_gpu_diagnostics()}"
+            )
+            _set_vllm_startup_error(message)
+            raise RuntimeError(message)
         try:
-            r = requests.get(f"{VLLM_URL}/health", timeout=2)
-            if r.status_code == 200:
-                log.info("vLLM is ready")
-                return True
-        except requests.ConnectionError:
-            pass
+            health = requests.get(f"{VLLM_URL}/health", timeout=2)
+            if health.status_code == 200:
+                models = requests.get(f"{VLLM_URL}/v1/models", timeout=5)
+                if models.status_code == 200:
+                    VLLM_READY = True
+                    log.info("vLLM is ready")
+                    return True
+                last_error = (
+                    f"/v1/models returned {models.status_code}: "
+                    f"{_truncate_text(models.text)}"
+                )
+            else:
+                last_error = (
+                    f"/health returned {health.status_code}: "
+                    f"{_truncate_text(health.text)}"
+                )
+        except requests.RequestException as exc:
+            last_error = str(exc)
         time.sleep(2)
-    raise TimeoutError(f"vLLM did not start within {timeout}s")
+
+    message = f"vLLM did not become ready within {timeout}s"
+    if last_error:
+        message = f"{message}. Last readiness check: {last_error}"
+    _set_vllm_startup_error(message)
+    raise TimeoutError(message)
 
 
 def init_glmocr_sdk():
@@ -447,6 +543,25 @@ def handler(job):
         }
     log.info("Job %s: received request", job_id)
 
+    if VLLM_STARTUP_ERROR:
+        log.error("Job %s: refusing request because vLLM is unavailable", job_id)
+        return _vllm_error_payload(
+            job_id,
+            "Local vLLM server failed to initialize.",
+        )
+
+    if VLLM_PROCESS is not None and VLLM_PROCESS.poll() is not None:
+        message = (
+            f"Local vLLM process exited with code {VLLM_PROCESS.returncode}. "
+            f"GPU diagnostics: {_format_gpu_diagnostics()}"
+        )
+        _set_vllm_startup_error(message)
+        log.error("Job %s: %s", job_id, message)
+        return _vllm_error_payload(
+            job_id,
+            "Local vLLM process is not running.",
+        )
+
     sdk_result = _parse_with_sdk(job_input, job_id)
     if sdk_result is not None:
         log.info("Job %s: completed via glm-ocr SDK", job_id)
@@ -481,27 +596,45 @@ def handler(job):
         )
 
         if response.status_code != 200:
+            body = _truncate_text(response.text, 4000)
             log.error(
                 "Job %s: vLLM returned %s with body: %s",
                 job_id,
                 response.status_code,
-                response.text,
+                body,
             )
-
-        response.raise_for_status()
+            return _vllm_error_payload(
+                job_id,
+                f"Local vLLM server returned HTTP {response.status_code}.",
+                http_status=response.status_code,
+                response_body=body,
+            )
         result = response.json()
         log.info("Job %s: completed", job_id)
         return result
     except requests.exceptions.RequestException as exc:
         detail = ""
         if getattr(exc, "response", None) is not None:
-            detail = f" | response_body={exc.response.text}"
+            detail = f" | response_body={_truncate_text(exc.response.text, 4000)}"
         log.error("Job %s: failed - %s%s", job_id, exc, detail)
-        raise
+        return _vllm_error_payload(
+            job_id,
+            "Request to local vLLM server failed.",
+            request_error=str(exc),
+            response_body=_truncate_text(
+                getattr(getattr(exc, "response", None), "text", ""),
+                4000,
+            ),
+        )
 
 
 if __name__ == "__main__":
-    vllm_process = start_vllm()
-    wait_for_vllm()
+    VLLM_PROCESS = start_vllm()
+    try:
+        wait_for_vllm(VLLM_PROCESS)
+    except Exception as exc:
+        _set_vllm_startup_error(str(exc))
+        log.error("Worker startup aborted: %s", exc)
+        sys.exit(1)
     OCR_PARSER = init_glmocr_sdk()
     runpod.serverless.start({"handler": handler})
