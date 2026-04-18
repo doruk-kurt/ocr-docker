@@ -12,9 +12,10 @@ RUN pip uninstall -y transformers || true \
  && pip install -U "glmocr[selfhosted] @ git+https://github.com/zai-org/glm-ocr.git" \
  && pip install runpod requests pillow pandas
 
-# Pre-download model weights into the image so cold starts don't hit HuggingFace
+# Pre-download the OCR model and official layout detector into the image so
+# cold starts and offline mode do not block SDK initialization.
 ENV HF_HOME=/root/.cache/huggingface
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR')"
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR'); snapshot_download('PaddlePaddle/PP-DocLayoutV3_safetensors')"
 ENV HF_HUB_OFFLINE=1
 
 # Persist vLLM compile cache on network volume to speed up cold starts
