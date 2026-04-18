@@ -208,8 +208,19 @@ def init_glmocr_sdk():
         return None
 
     try:
-        parser = GlmOcr()
-        log.info("GLM-OCR SDK initialized")
+        parser = GlmOcr(
+            mode="selfhosted",
+            model=MODEL_NAME,
+            ocr_api_host="localhost",
+            ocr_api_port=VLLM_PORT,
+            layout_device=os.getenv("GLMOCR_LAYOUT_DEVICE"),
+        )
+        log.info(
+            "GLM-OCR SDK initialized in selfhosted mode (model=%s, host=%s, port=%s)",
+            MODEL_NAME,
+            "localhost",
+            VLLM_PORT,
+        )
         return parser
     except Exception as exc:
         log.warning("Failed to initialize glm-ocr SDK: %s", exc)
