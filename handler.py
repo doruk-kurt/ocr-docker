@@ -240,9 +240,28 @@ def _set_image_url(content_part, new_url):
         content_part["image_url"] = {"url": new_url}
 
 
-def _extract_job_image_and_prompt(job_input):
-    """Extract first image URL/path and prompt text from supported payload shapes."""
-    image_ref = None
+def _append_prompt_text(prompt_parts, value):
+    """Append a non-empty prompt fragment."""
+    if isinstance(value, str) and value.strip():
+        prompt_parts.append(value.strip())
+
+
+def _normalize_sdk_images(value):
+    """Normalize supported SDK image inputs into a string or string list."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    if isinstance(value, list):
+        normalized = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if normalized:
+            return normalized
+
+    return None
+
+
+def _extract_sdk_input_and_prompt(job_input):
+    """Extract SDK parse input and prompt from supported payload shapes."""
+    sdk_input = None
     prompt_parts = []
 
     if isinstance(job_input, str):
@@ -251,20 +270,23 @@ def _extract_job_image_and_prompt(job_input):
     if not isinstance(job_input, dict):
         return None, ""
 
-    image_ref = job_input.get("url") or job_input.get("image")
-    prompt = job_input.get("prompt")
-    if isinstance(prompt, str) and prompt.strip():
-        prompt_parts.append(prompt.strip())
+    sdk_input = _normalize_sdk_images(job_input.get("images"))
+    if sdk_input is None:
+        sdk_input = _normalize_sdk_images(job_input.get("image"))
+    if sdk_input is None:
+        sdk_input = _normalize_sdk_images(job_input.get("url"))
+
+    _append_prompt_text(prompt_parts, job_input.get("prompt"))
 
     messages = job_input.get("messages")
+    collected_images = []
     if isinstance(messages, list):
         for message in messages:
             if not isinstance(message, dict):
                 continue
             content = message.get("content")
             if isinstance(content, str):
-                if content.strip():
-                    prompt_parts.append(content.strip())
+                _append_prompt_text(prompt_parts, content)
                 continue
             if not isinstance(content, list):
                 continue
@@ -272,14 +294,16 @@ def _extract_job_image_and_prompt(job_input):
             for part in content:
                 if not isinstance(part, dict):
                     continue
-                if image_ref is None:
-                    image_ref = _extract_image_url(part)
+                image_url = _extract_image_url(part)
+                if image_url is not None:
+                    collected_images.append(image_url)
                 if part.get("type") == "text":
-                    text = part.get("text")
-                    if isinstance(text, str) and text.strip():
-                        prompt_parts.append(text.strip())
+                    _append_prompt_text(prompt_parts, part.get("text"))
 
-    return image_ref, "\n".join(prompt_parts).strip()
+    if sdk_input is None:
+        sdk_input = _normalize_sdk_images(collected_images)
+
+    return sdk_input, "\n".join(prompt_parts).strip()
 
 
 def _read_image_bytes(url):
@@ -382,10 +406,10 @@ def _resize_image_to_file_path(image_bytes, max_side):
         return tmp.name, (width, height), new_size
 
 
-def _prepare_image_for_sdk(image_ref, job_id):
-    """Return image path/url for SDK parse and list of temp files to clean up."""
+def _prepare_sdk_source(image_ref, job_id, source_label="input"):
+    """Return one SDK source after optional resize plus temp files to clean up."""
     cleanup_paths = []
-    if MAX_IMAGE_SIDE <= 0:
+    if MAX_IMAGE_SIDE <= 0 or not isinstance(image_ref, str):
         return image_ref, cleanup_paths
 
     try:
@@ -398,8 +422,9 @@ def _prepare_image_for_sdk(image_ref, job_id):
 
         cleanup_paths.append(resized_path)
         log.info(
-            "Job %s: SDK image resized from %sx%s to %sx%s",
+            "Job %s: SDK %s resized from %sx%s to %sx%s",
             job_id,
+            source_label,
             old_size[0],
             old_size[1],
             new_size[0],
@@ -407,8 +432,26 @@ def _prepare_image_for_sdk(image_ref, job_id):
         )
         return resized_path, cleanup_paths
     except Exception as exc:
-        log.warning("Job %s: SDK image resize skipped (%s)", job_id, exc)
+        log.warning("Job %s: SDK %s resize skipped (%s)", job_id, source_label, exc)
         return image_ref, cleanup_paths
+
+
+def _prepare_sdk_input(sdk_input, job_id):
+    """Prepare SDK input, supporting either a single source or a list of pages."""
+    if isinstance(sdk_input, list):
+        prepared = []
+        cleanup_paths = []
+        for index, source in enumerate(sdk_input, start=1):
+            prepared_source, source_cleanup = _prepare_sdk_source(
+                source,
+                job_id,
+                source_label=f"page {index}",
+            )
+            prepared.append(prepared_source)
+            cleanup_paths.extend(source_cleanup)
+        return prepared, cleanup_paths
+
+    return _prepare_sdk_source(sdk_input, job_id)
 
 
 def _normalize_sdk_result(result):
@@ -432,11 +475,11 @@ def _parse_with_sdk(job_input, job_id):
     if OCR_PARSER is None:
         return None
 
-    image_ref, prompt = _extract_job_image_and_prompt(job_input)
-    if not image_ref:
+    sdk_input, prompt = _extract_sdk_input_and_prompt(job_input)
+    if not sdk_input:
         return None
 
-    image_input, cleanup_paths = _prepare_image_for_sdk(image_ref, job_id)
+    image_input, cleanup_paths = _prepare_sdk_input(sdk_input, job_id)
     try:
         # Some SDK versions support prompt kwarg; fall back to image-only parse.
         if prompt:

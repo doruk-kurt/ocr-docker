@@ -4,12 +4,15 @@ Docker image for running [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) (0.9B
 
 Model weights are baked into the image at build time for fast cold starts.
 
+The worker prefers the official `glmocr` self-hosted pipeline when it can. That means document parsing requests use the SDK's layout detection plus structured post-processing on top of the locally hosted GLM-OCR model instead of calling the raw model alone.
+
 ## What's included
 
 - **Base image:** `vllm/vllm-openai:nightly`
 - **Model:** [zai-org/GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) (MIT License)
 - **Transformers:** v5+ dev branch (required by GLM-OCR)
 - **Serving:** vLLM on port 8080
+- **Parsing pipeline:** official `glmocr[selfhosted]` SDK with local layout detection
 
 ## Deploy on RunPod Serverless
 
@@ -72,6 +75,31 @@ curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
     }
   }'
 ```
+
+### SDK-style parsing request
+
+You can also send a direct document parsing payload. This path maps most closely to the official self-hosted SDK:
+
+```bash
+curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
+  -H "Authorization: Bearer <RUNPOD_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": {
+      "images": [
+        "https://upload.wikimedia.org/wikipedia/commons/9/99/ReceiptSwiss.jpg"
+      ],
+      "prompt": "Text Recognition:"
+    }
+  }'
+```
+
+Accepted SDK-first input shapes:
+
+- `{"input": "<image_or_pdf_url_or_path>"}` for a single source
+- `{"input": {"images": "<image_or_pdf_url_or_path>"}}` for a single source
+- `{"input": {"images": ["page1", "page2"]}}` for a multi-page document
+- `{"input": {"messages": [...]}}` for OpenAI-style image requests; the worker extracts image inputs and prompt text for the SDK when possible
 
 ## Build locally
 

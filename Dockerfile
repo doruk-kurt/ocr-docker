@@ -5,10 +5,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 
 # Install newer Transformers so GLM-OCR is recognized, plus worker/runtime deps.
+# The selfhosted extra pulls in the official layout-detection pipeline dependencies.
 # vLLM nightly currently imports pandas during CLI startup.
 RUN pip uninstall -y transformers || true \
  && pip install -U git+https://github.com/huggingface/transformers.git \
- && pip install -U git+https://github.com/zai-org/glm-ocr.git \
+ && pip install -U "glmocr[selfhosted] @ git+https://github.com/zai-org/glm-ocr.git" \
  && pip install runpod requests pillow pandas
 
 # Pre-download model weights into the image so cold starts don't hit HuggingFace
@@ -24,10 +25,11 @@ ENV SPECULATIVE_CONFIG='{"method":"mtp","num_speculative_tokens":1}'
 ENV ENFORCE_EAGER=0
 ENV MAX_IMAGE_SIDE=2000
 ENV USE_GLMOCR_SDK=1
+ENV GLMOCR_LAYOUT_DEVICE=cpu
 
 # Force glm-ocr SDK to use local vLLM instead of MaaS.
 RUN mkdir -p /root/.config/glm-ocr \
- && printf "pipeline:\n  maas:\n    enabled: false\n  ocr_api:\n    api_host: localhost\n    api_port: 8080\n" > /root/.config/glm-ocr/config.yaml
+ && printf "pipeline:\n  maas:\n    enabled: false\n  ocr_api:\n    api_url: http://localhost:8080/v1/chat/completions\n    api_mode: openai\n    model: glm-ocr\n" > /root/.config/glm-ocr/config.yaml
 
 COPY handler.py /handler.py
 
